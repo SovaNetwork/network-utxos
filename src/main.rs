@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 use parking_lot::RwLock;
 use tracing::{info, error, instrument};
 use chrono::{DateTime, Utc};
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Host address to bind to
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port to listen on
+    #[arg(long, default_value = "5557")]
+    port: u16,
+
+    /// Log level
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct BlockUpdate {
@@ -355,13 +372,19 @@ async fn select_utxos(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(&args.log_level)
+        .init();
+
     info!("Starting UTXO tracking service");
 
     let db = UtxoDatabase::new();
     let state = web::Data::new(AppState { db });
 
-    info!("Starting webhook server on 127.0.0.1:5557");
+    let bind_addr = format!("{}:{}", args.host, args.port);
+    info!("Starting webhook server on {}", bind_addr);
 
     HttpServer::new(move || {
         App::new()
@@ -381,7 +404,7 @@ async fn main() -> std::io::Result<()> {
                 web::get().to(select_utxos)
             )
     })
-    .bind(("127.0.0.1", 5557))?
+    .bind(bind_addr)?
     .run()
     .await
 }
