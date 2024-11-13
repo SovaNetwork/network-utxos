@@ -18,15 +18,24 @@ The service will now be running at http://localhost:5557.
 ### UTXO Database
 The service maintains three main data structures:
 
-1. Current UTXO set: Maps addresses to their current unspent outputs
-2. Block history: Tracks UTXOs created or spent in each block
+1. Current UTXO set: Maps addresses to their current unspent outputs (stored in `utxos.csv`)
+2. Block history: Tracks UTXOs created or spent in each block (stored in `blocks.csv`)
 3. Latest block height: Tracks the most recent processed block
+
+### Data Persistence
+
+- Uses append-only CSV files
+- Maintains two separate files:
+  - `data/utxos.csv`: Stores the current UTXO set and updates
+  - `data/blocks.csv`: Records block-level UTXO history
+- Automatically loads existing state on startup
 
 ### Concurrency
 
 - Uses parking_lot::RwLock for efficient concurrent access
 - Supports multiple readers with single writer access
 - Thread-safe UTXO updates and queries
+- Safe concurrent access to CSV files
 
 ### UTXO Selection
 
