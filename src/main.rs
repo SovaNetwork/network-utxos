@@ -1,3 +1,11 @@
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io,
+    path::PathBuf,
+    sync::Arc,
+};
+
 use actix_web::{
     middleware::Logger,
     web::{self, Json},
@@ -8,13 +16,6 @@ use clap::Parser;
 use csv::{Reader, Writer};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fs::{self, OpenOptions},
-    io,
-    path::PathBuf,
-    sync::Arc,
-};
 use tracing::{error, info, instrument};
 
 #[derive(Parser, Debug)]
@@ -34,6 +35,7 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BlockUpdate {
     height: i32,
     hash: String,
