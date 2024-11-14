@@ -237,13 +237,19 @@ impl UtxoDatabase {
     fn save_changes(&self, changes: PendingChanges) -> io::Result<()> {
         // Save UTXOs
         if !changes.new_utxos.is_empty() {
+            let utxo_path = self.get_utxo_file_path();
+            let needs_header = !utxo_path.exists();
+
             let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .append(true)
-                .open(self.get_utxo_file_path())?;
+                .open(&utxo_path)?;
 
-            let mut writer = Writer::from_writer(file);
+            // Create a Writer that uses the file's current position
+            let mut writer = csv::WriterBuilder::new()
+                .has_headers(needs_header) // Only write headers if it's a new file
+                .from_writer(file);
 
             for (address, utxos) in changes.new_utxos {
                 for utxo in utxos {
@@ -256,13 +262,19 @@ impl UtxoDatabase {
 
         // Save blocks
         if !changes.new_block_utxos.is_empty() {
+            let block_path = self.get_block_file_path();
+            let needs_header = !block_path.exists();
+
             let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .append(true)
-                .open(self.get_block_file_path())?;
+                .open(&block_path)?;
 
-            let mut writer = Writer::from_writer(file);
+            // Create a Writer that uses the file's current position
+            let mut writer = csv::WriterBuilder::new()
+                .has_headers(needs_header) // Only write headers if it's a new file
+                .from_writer(file);
 
             for (height, block_data) in changes.new_block_utxos {
                 for (address, utxos) in block_data {
