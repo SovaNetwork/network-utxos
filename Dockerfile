@@ -30,12 +30,17 @@ RUN apt-get update && \
 # Copy the binary from builder
 COPY --from=builder /usr/src/app/target/release/hyperstate-utxos /usr/local/bin/
 
-# Create a non-root user with specific UID
-RUN useradd -m -u 1001 webhook
-USER webhook
+# Create a non-root user with specific UID and create data directory
+RUN useradd -m -u 1001 webhook && \
+    mkdir -p /data && \
+    chown -R webhook:webhook /data
 
 # Set environment variables
 ENV RUST_LOG=info
+
+# Switch to non-root user
+USER webhook
+WORKDIR /data
 
 # Expose the webhook server port
 EXPOSE 5557
