@@ -34,6 +34,131 @@ struct Args {
     log_level: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct UtxoRow {
+    // Key fields for storage
+    address: String,
+    utxo_id: String,
+
+    // UTXO data fields
+    id: String,
+    utxo_address: String,
+    public_key: Option<String>,
+    txid: String,
+    vout: i32,
+    amount: i64,
+    script_pub_key: String,
+    script_type: String,
+    created_at: DateTime<Utc>,
+    block_height: i32,
+    spent_txid: Option<String>,
+    spent_at: Option<DateTime<Utc>>,
+    spent_block: Option<i32>,
+}
+
+impl UtxoRow {
+    fn new(address: String, utxo: UtxoUpdate) -> Self {
+        Self {
+            address,
+            utxo_id: utxo.id.clone(),
+            id: utxo.id,
+            utxo_address: utxo.address,
+            public_key: utxo.public_key,
+            txid: utxo.txid,
+            vout: utxo.vout,
+            amount: utxo.amount,
+            script_pub_key: utxo.script_pub_key,
+            script_type: utxo.script_type,
+            created_at: utxo.created_at,
+            block_height: utxo.block_height,
+            spent_txid: utxo.spent_txid,
+            spent_at: utxo.spent_at,
+            spent_block: utxo.spent_block,
+        }
+    }
+
+    fn into_storage_entry(self) -> (String, String, UtxoUpdate) {
+        let utxo = UtxoUpdate {
+            id: self.id,
+            address: self.utxo_address,
+            public_key: self.public_key,
+            txid: self.txid,
+            vout: self.vout,
+            amount: self.amount,
+            script_pub_key: self.script_pub_key,
+            script_type: self.script_type,
+            created_at: self.created_at,
+            block_height: self.block_height,
+            spent_txid: self.spent_txid,
+            spent_at: self.spent_at,
+            spent_block: self.spent_block,
+        };
+        (self.address, self.utxo_id, utxo)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BlockRow {
+    // Key fields
+    height: i32,
+    address: String,
+
+    // UTXO data fields
+    id: String,
+    utxo_address: String,
+    public_key: Option<String>,
+    txid: String,
+    vout: i32,
+    amount: i64,
+    script_pub_key: String,
+    script_type: String,
+    created_at: DateTime<Utc>,
+    block_height: i32,
+    spent_txid: Option<String>,
+    spent_at: Option<DateTime<Utc>>,
+    spent_block: Option<i32>,
+}
+
+impl BlockRow {
+    fn new(height: i32, address: String, utxo: UtxoUpdate) -> Self {
+        Self {
+            height,
+            address,
+            id: utxo.id,
+            utxo_address: utxo.address,
+            public_key: utxo.public_key,
+            txid: utxo.txid,
+            vout: utxo.vout,
+            amount: utxo.amount,
+            script_pub_key: utxo.script_pub_key,
+            script_type: utxo.script_type,
+            created_at: utxo.created_at,
+            block_height: utxo.block_height,
+            spent_txid: utxo.spent_txid,
+            spent_at: utxo.spent_at,
+            spent_block: utxo.spent_block,
+        }
+    }
+
+    fn into_utxo(self) -> UtxoUpdate {
+        UtxoUpdate {
+            id: self.id,
+            address: self.utxo_address,
+            public_key: self.public_key,
+            txid: self.txid,
+            vout: self.vout,
+            amount: self.amount,
+            script_pub_key: self.script_pub_key,
+            script_type: self.script_type,
+            created_at: self.created_at,
+            block_height: self.block_height,
+            spent_txid: self.spent_txid,
+            spent_at: self.spent_at,
+            spent_block: self.spent_block,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct BlockUpdate {
@@ -66,15 +191,16 @@ struct PendingChanges {
     new_block_utxos: HashMap<i32, HashMap<String, Vec<UtxoUpdate>>>, // height -> address -> UTXOs
 }
 
+/// UTXO database
+/// - utxos: btc_address -> HashMap<utxo_id, UtxoUpdate> (current UTXO set)
+/// - blocks: block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
+/// - latest_block: latest processed block height
+/// - data_dir: data directory
 #[derive(Default)]
 struct UtxoDatabase {
-    // btc_address -> HashMap<utxo_id, UtxoUpdate> (current UTXO set)
     utxos: RwLock<HashMap<String, HashMap<String, UtxoUpdate>>>,
-    // block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
     blocks: RwLock<HashMap<i32, HashMap<String, Vec<UtxoUpdate>>>>,
-    // latest processed block height
     latest_block: RwLock<i32>,
-    // data directory
     data_dir: PathBuf,
 }
 
@@ -109,7 +235,7 @@ impl UtxoDatabase {
     }
 
     fn save_changes(&self, changes: PendingChanges) -> io::Result<()> {
-        // Save only modified UTXOs
+        // Save UTXOs
         if !changes.new_utxos.is_empty() {
             let file = OpenOptions::new()
                 .write(true)
@@ -121,28 +247,14 @@ impl UtxoDatabase {
 
             for (address, utxos) in changes.new_utxos {
                 for utxo in utxos {
-                    writer.serialize((
-                        &address,
-                        &utxo.id,
-                        &utxo.address,
-                        &utxo.public_key,
-                        &utxo.txid,
-                        utxo.vout,
-                        utxo.amount,
-                        &utxo.script_pub_key,
-                        &utxo.script_type,
-                        utxo.created_at,
-                        utxo.block_height,
-                        &utxo.spent_txid,
-                        utxo.spent_at,
-                        utxo.spent_block,
-                    ))?;
+                    let row = UtxoRow::new(address.clone(), utxo);
+                    writer.serialize(&row)?;
                 }
             }
             writer.flush()?;
         }
 
-        // Save only new block data
+        // Save blocks
         if !changes.new_block_utxos.is_empty() {
             let file = OpenOptions::new()
                 .write(true)
@@ -155,23 +267,8 @@ impl UtxoDatabase {
             for (height, block_data) in changes.new_block_utxos {
                 for (address, utxos) in block_data {
                     for utxo in utxos {
-                        writer.serialize((
-                            height,
-                            &address,
-                            &utxo.id,
-                            &utxo.address,
-                            &utxo.public_key,
-                            &utxo.txid,
-                            utxo.vout,
-                            utxo.amount,
-                            &utxo.script_pub_key,
-                            &utxo.script_type,
-                            utxo.created_at,
-                            utxo.block_height,
-                            &utxo.spent_txid,
-                            utxo.spent_at,
-                            utxo.spent_block,
-                        ))?;
+                        let row = BlockRow::new(height, address.clone(), utxo);
+                        writer.serialize(&row)?;
                     }
                 }
             }
@@ -197,53 +294,8 @@ impl UtxoDatabase {
         let mut utxos = self.utxos.write();
 
         for result in reader.deserialize() {
-            let (
-                address,
-                utxo_id,
-                utxo_address,
-                public_key,
-                txid,
-                vout,
-                amount,
-                script_pub_key,
-                script_type,
-                created_at,
-                block_height,
-                spent_txid,
-                spent_at,
-                spent_block,
-            ): (
-                String,
-                String,
-                String,
-                Option<String>,
-                String,
-                i32,
-                i64,
-                String,
-                String,
-                DateTime<Utc>,
-                i32,
-                Option<String>,
-                Option<DateTime<Utc>>,
-                Option<i32>,
-            ) = result?;
-
-            let utxo = UtxoUpdate {
-                id: utxo_id.clone(),
-                address: utxo_address,
-                public_key,
-                txid,
-                vout,
-                amount,
-                script_pub_key,
-                script_type,
-                created_at,
-                block_height,
-                spent_txid,
-                spent_at,
-                spent_block,
-            };
+            let row: UtxoRow = result?;
+            let (address, utxo_id, utxo) = row.into_storage_entry();
 
             utxos.entry(address).or_default().insert(utxo_id, utxo);
         }
@@ -262,67 +314,19 @@ impl UtxoDatabase {
         let mut latest_height = 0;
 
         for result in reader.deserialize() {
-            let (
-                height,
-                address,
-                id,
-                utxo_address,
-                public_key,
-                txid,
-                vout,
-                amount,
-                script_pub_key,
-                script_type,
-                created_at,
-                block_height,
-                spent_txid,
-                spent_at,
-                spent_block,
-            ): (
-                i32,
-                String,
-                String,
-                String,
-                Option<String>,
-                String,
-                i32,
-                i64,
-                String,
-                String,
-                DateTime<Utc>,
-                i32,
-                Option<String>,
-                Option<DateTime<Utc>>,
-                Option<i32>,
-            ) = result?;
-
-            let utxo = UtxoUpdate {
-                id,
-                address: utxo_address,
-                public_key,
-                txid,
-                vout,
-                amount,
-                script_pub_key,
-                script_type,
-                created_at,
-                block_height,
-                spent_txid,
-                spent_at,
-                spent_block,
-            };
+            let row: BlockRow = result?;
+            let row_clone = row.clone();
 
             blocks
-                .entry(height)
+                .entry(row.height)
                 .or_default()
-                .entry(address)
+                .entry(row.address)
                 .or_default()
-                .push(utxo);
+                .push(row_clone.into_utxo());
 
-            latest_height = latest_height.max(height);
+            latest_height = latest_height.max(row.height);
         }
 
-        // Update latest block height
         if latest_height > 0 {
             *self.latest_block.write() = latest_height;
         }
@@ -395,7 +399,9 @@ impl UtxoDatabase {
             *self.latest_block.write() = height;
 
             // Track new block data for saving
-            pending_changes.new_block_utxos.insert(height, block_utxos_clone);
+            pending_changes
+                .new_block_utxos
+                .insert(height, block_utxos_clone);
         }
 
         if let Err(e) = self.save_changes(pending_changes) {
