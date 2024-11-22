@@ -189,16 +189,14 @@ struct UtxoUpdate {
 
 struct PendingChanges {
     height: i32,
-    new_utxos: HashMap<String, Vec<UtxoUpdate>>, // address -> new UTXOs
     utxos_update: Vec<UtxoUpdate>, // address -> modified UTXOs
     utxos_insert: Vec<UtxoUpdate>,
-    new_block_utxos: HashMap<i32, HashMap<String, Vec<UtxoUpdate>>>, // height -> address -> UTXOs
 }
 
 trait Datasource {
     fn get_type(&self) -> String;
     fn get_latest_block(&self) -> i32;
-    fn process_block_utxos(&mut self, pending_changes: &PendingChanges);
+    fn process_block_utxos(&self, pending_changes: &PendingChanges);
     fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate>;
     fn get_utxos_for_block_and_address(&self, block_height: i32, address: &str) -> Option<Vec<UtxoUpdate>>;
 }
@@ -307,7 +305,7 @@ impl Datasource for UtxoCSVDatasource {
         String::from("CSV")
     }
 
-    fn process_block_utxos(&mut self, changes: &PendingChanges) {
+    fn process_block_utxos(&self, changes: &PendingChanges) {
         let mut utxos = self.utxos.write();
         let mut block_utxos: HashMap<String, Vec<UtxoUpdate>> = HashMap::new();
 
@@ -379,22 +377,22 @@ impl Datasource for UtxoCSVDatasource {
 }
 
 struct UtxoSqliteDatasource {
-    conn: Connection,
+    conn: RwLock<Connection>,
 }
 
 impl UtxoSqliteDatasource {
-    fn new(&mut self, db_path: &str) -> Self {
-        let errMsg = format!("Could not open connection to Sqlite db: {}", db_path);
-        let conn = Connection::open(db_path).expect(&errMsg);
+    fn new(&self, db_path: &str) -> Arc<Self> {
+        let err_msg = format!("Could not open connection to Sqlite db: {}", db_path);
+        let conn = Connection::open(db_path).expect(&err_msg);
 
-        self.run_migrations();
+        let _ = self.run_migrations();
 
-        Self {
-            conn: conn,
-        }
+        return Arc::new(Self {
+            conn: RwLock::new(conn),
+        });
     }
 
-    fn run_migrations(&mut self) -> Result<()> {
+    fn run_migrations(&self) -> Result<()> {
         let migrations = Migrations::new(vec![
             M::up("CREATE TABLE IF NOT EXISTS utxo_row (
                 address TEXT NOT NULL,
@@ -415,7 +413,9 @@ impl UtxoSqliteDatasource {
             )"),
         ]);
 
-        migrations.to_latest(&mut self.conn);
+        let mut conn = self.conn.write();
+
+        let _ = migrations.to_latest(&mut conn);
 
         Ok(())
     }
@@ -457,6 +457,7 @@ impl Datasource for UtxoSqliteDatasource {
     }
 
     fn get_latest_block(&self) -> i32 {
+        let conn = self.conn.read();
         let query = "
             SELECT MAX(
                 CASE
@@ -467,7 +468,7 @@ impl Datasource for UtxoSqliteDatasource {
             FROM utxo_row;
         ";
 
-        match self.conn.query_row(query, [], |row| row.get(0)) {
+        match conn.query_row(query, [], |row| row.get(0)) {
             Ok(latest_block) => latest_block,
             Err(e) => {
                 eprintln!("Failed to query the latest block: {}", e);
@@ -476,9 +477,11 @@ impl Datasource for UtxoSqliteDatasource {
         }
     }
 
-    fn process_block_utxos(&mut self, changes: &PendingChanges) {
+    fn process_block_utxos(&self, changes: &PendingChanges) {
+        let mut conn = self.conn.write();
+
         // Start a transaction
-        let tx = match self.conn.transaction() {
+        let tx = match conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {
                 eprintln!("Failed to start transaction: {}", e);
@@ -513,7 +516,9 @@ impl Datasource for UtxoSqliteDatasource {
     }
 
     fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn.read();
+
+        let mut stmt = match conn.prepare(
             "SELECT 
                 id, address, public_key, txid, vout, amount, script_pub_key, 
                 script_type, created_at, block_height, spent_txid, spent_at, spent_block
@@ -576,7 +581,7 @@ impl Datasource for UtxoSqliteDatasource {
         block_height: i32,
         address: &str,
     ) -> Option<Vec<UtxoUpdate>> {
-        // Prepare the SQL query
+        let conn = self.conn.read();
         let query = "
             SELECT 
                 id, address, public_key, txid, vout, amount, script_pub_key, 
@@ -586,7 +591,7 @@ impl Datasource for UtxoSqliteDatasource {
         ";
 
         // Prepare the statement
-        let mut stmt = match self.conn.prepare(query) {
+        let mut stmt = match conn.prepare(query) {
             Ok(stmt) => stmt,
             Err(e) => {
                 eprintln!("Failed to prepare statement: {}", e);
@@ -670,16 +675,14 @@ impl UtxoDatabase {
     }
 
     #[instrument(skip(self, block), fields(block_height = block.height))]
-    async fn process_block(&mut self, block: BlockUpdate) -> Result<(), String> {
+    async fn process_block(&self, block: BlockUpdate) -> Result<(), String> {
         let height = block.height;
         info!(height, "Processing new block");
 
         let mut pending_changes = PendingChanges {
             height: height,
-            new_utxos: HashMap::new(),
             utxos_update: Vec::new(),
             utxos_insert: Vec::new(),
-            new_block_utxos: HashMap::new(),
         };
 
         // Process UTXO updates
