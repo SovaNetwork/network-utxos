@@ -14,6 +14,8 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use csv::{Reader, Writer};
 use parking_lot::RwLock;
+use r2d2::{ Pool };
+use r2d2_sqlite::{ SqliteConnectionManager };
 use rusqlite::{params, Connection, Result};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,10 @@ struct Args {
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Datasource type
+    #[arg(long, default_value = "csv")]
+    datasource: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,6 +200,7 @@ struct PendingChanges {
 }
 
 trait Datasource {
+    fn setup(&self);
     fn get_type(&self) -> String;
     fn get_latest_block(&self) -> i32;
     fn process_block_utxos(&self, pending_changes: &PendingChanges);
@@ -211,8 +218,9 @@ struct UtxoCSVDatasource {
 }
 
 impl UtxoCSVDatasource {
-    fn new(data_dir: PathBuf) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         // Create data directory if it doesn't exist
+        let data_dir = std::env::current_dir().unwrap().join("data");
         fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
         let db = Arc::new(Self {
@@ -296,6 +304,11 @@ impl UtxoCSVDatasource {
 }
 
 impl Datasource for UtxoCSVDatasource {
+    fn setup(&self) {
+        // No setup required
+        return;
+    }
+
     fn get_latest_block(&self) -> i32 {
         let value = self.latest_block.read();
         *value
@@ -377,24 +390,27 @@ impl Datasource for UtxoCSVDatasource {
 }
 
 struct UtxoSqliteDatasource {
-    conn: RwLock<Connection>,
+    conn: Pool<SqliteConnectionManager>,
 }
 
 impl UtxoSqliteDatasource {
-    fn new(&self, db_path: &str) -> Arc<Self> {
-        let err_msg = format!("Could not open connection to Sqlite db: {}", db_path);
-        let conn = Connection::open(db_path).expect(&err_msg);
+    fn new() -> Arc<Self> {
+        let data_dir = std::env::current_dir().unwrap().join("data");
+        fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+        let db_dir = data_dir.join("utxo.db");
+        let db_path = db_dir.to_str().unwrap();
 
-        let _ = self.run_migrations();
+        let manager = SqliteConnectionManager::file(db_path);
+        let conn = Pool::new(manager).unwrap();
 
         return Arc::new(Self {
-            conn: RwLock::new(conn),
+            conn: conn,
         });
     }
 
     fn run_migrations(&self) -> Result<()> {
         let migrations = Migrations::new(vec![
-            M::up("CREATE TABLE IF NOT EXISTS utxo_row (
+            M::up("CREATE TABLE IF NOT EXISTS utxo (
                 address TEXT NOT NULL,
                 utxo_id TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -413,7 +429,7 @@ impl UtxoSqliteDatasource {
             )"),
         ]);
 
-        let mut conn = self.conn.write();
+        let mut conn = self.conn.get().unwrap();
 
         let _ = migrations.to_latest(&mut conn);
 
@@ -422,7 +438,7 @@ impl UtxoSqliteDatasource {
 
     fn upsert_utxo_in_tx(tx: &rusqlite::Transaction, utxo: &UtxoUpdate) -> rusqlite::Result<()> {
         tx.execute(
-            "INSERT INTO utxo_row (
+            "INSERT INTO utxo (
                 id, address, public_key, txid, vout, amount, script_pub_key, 
                 script_type, created_at, block_height, spent_txid, spent_at, spent_block
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -452,12 +468,18 @@ impl UtxoSqliteDatasource {
 }
 
 impl Datasource for UtxoSqliteDatasource {
+    fn setup(&self) {
+        let _ = self.run_migrations();
+
+        return;
+    }
+
     fn get_type(&self) -> String {
-        String::from("SQLite")
+        String::from("Sqlite")
     }
 
     fn get_latest_block(&self) -> i32 {
-        let conn = self.conn.read();
+        let conn = self.conn.get().unwrap();
         let query = "
             SELECT MAX(
                 CASE
@@ -465,7 +487,7 @@ impl Datasource for UtxoSqliteDatasource {
                     ELSE block_height
                 END
             ) AS latest_block
-            FROM utxo_row;
+            FROM utxo;
         ";
 
         match conn.query_row(query, [], |row| row.get(0)) {
@@ -478,7 +500,7 @@ impl Datasource for UtxoSqliteDatasource {
     }
 
     fn process_block_utxos(&self, changes: &PendingChanges) {
-        let mut conn = self.conn.write();
+        let mut conn = self.conn.get().unwrap();
 
         // Start a transaction
         let tx = match conn.transaction() {
@@ -516,13 +538,13 @@ impl Datasource for UtxoSqliteDatasource {
     }
 
     fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate> {
-        let conn = self.conn.read();
+        let conn = self.conn.get().unwrap();
 
         let mut stmt = match conn.prepare(
             "SELECT 
                 id, address, public_key, txid, vout, amount, script_pub_key, 
                 script_type, created_at, block_height, spent_txid, spent_at, spent_block
-             FROM utxo_row
+             FROM utxo
              WHERE block_height <= ?1 AND spent_at IS NULL AND address = ?2",
         ) {
             Ok(stmt) => stmt,
@@ -581,12 +603,12 @@ impl Datasource for UtxoSqliteDatasource {
         block_height: i32,
         address: &str,
     ) -> Option<Vec<UtxoUpdate>> {
-        let conn = self.conn.read();
+        let conn = self.conn.get().unwrap();
         let query = "
             SELECT 
                 id, address, public_key, txid, vout, amount, script_pub_key, 
                 script_type, created_at, block_height, spent_txid, spent_at, spent_block
-            FROM utxo_row
+            FROM utxo
             WHERE block_height = ?1 AND address = ?2;
         ";
 
@@ -654,20 +676,17 @@ impl Datasource for UtxoSqliteDatasource {
 /// - blocks: block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
 /// - latest_block: latest processed block height
 /// - data_dir: data directory
-#[derive(Default)]
 struct UtxoDatabase {
-    datasource: Arc<UtxoCSVDatasource>,
+    datasource: Arc<dyn Datasource + Send + Sync>, // Send + Sync to make Arc thread safe
 }
 
 impl UtxoDatabase {
-    fn new(datasource: Arc<UtxoCSVDatasource>) -> Arc<Self> {
+    fn new(datasource: Arc<dyn Datasource + Send + Sync>) -> Arc<Self> {
         info!("Initializing UTXO database with storage type: {}", datasource.get_type());
 
-        let db = Arc::new(Self {
-            datasource: datasource,
+        return Arc::new(Self {
+            datasource,
         });
-
-        db
     }
 
     fn get_latest_block(&self) -> i32 {
@@ -906,6 +925,14 @@ async fn select_utxos(
     HttpResponse::Ok().json(response)
 }
 
+fn create_datasource(arg: &str) -> Arc<dyn Datasource + Send + Sync> {
+    match arg {
+        "csv" => UtxoCSVDatasource::new(),
+        "sqlite" => UtxoSqliteDatasource::new(),
+        _ => panic!("Invalid argument for datasource: {}, Use 'csv' or 'sqlite'", arg),
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -915,9 +942,10 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     info!("Starting UTXO tracking service");
+    let datasource = create_datasource(&args.datasource);
 
-    let data_dir = std::env::current_dir()?.join("data");
-    let datasource = UtxoCSVDatasource::new(data_dir);
+    datasource.setup();
+
     let db = UtxoDatabase::new(datasource);
     let state = web::Data::new(AppState { db });
 
