@@ -411,10 +411,9 @@ impl UtxoSqliteDatasource {
     fn run_migrations(&self) -> Result<()> {
         let migrations = Migrations::new(vec![
             M::up("CREATE TABLE IF NOT EXISTS utxo (
+                vid INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
                 address TEXT NOT NULL,
-                utxo_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                utxo_address TEXT NOT NULL,
                 public_key TEXT,
                 txid TEXT NOT NULL,
                 vout INTEGER NOT NULL,
@@ -425,7 +424,8 @@ impl UtxoSqliteDatasource {
                 block_height INTEGER NOT NULL,
                 spent_txid TEXT,
                 spent_at TEXT,                 -- ISO 8061 format for timestamptz
-                spent_block INTEGER
+                spent_block INTEGER,
+                UNIQUE(txid, vout)             -- Ensure (txid, vout) is unique
             )"),
         ]);
 
