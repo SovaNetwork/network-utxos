@@ -14,6 +14,7 @@ run-dev:
         --host 127.0.0.1 \
         --port 5557 \
         --log-level info
+        --datasource sqlite
 
 # Run for docker/production (bind to all interfaces)
 run-docker:
@@ -21,6 +22,7 @@ run-docker:
         --host 0.0.0.0 \
         --port 5557 \
         --log-level info
+        --datasource sqlite
 
 # Run with custom parameters
 run-custom host port log_level:
@@ -28,3 +30,4 @@ run-custom host port log_level:
         --host {{host}} \
         --port {{port}} \
         --log-level {{log_level}}
+        --datasource {{datasource}}
