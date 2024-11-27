@@ -1,4 +1,5 @@
-use std::{ collections::HashMap,
+use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io,
     path::PathBuf,
@@ -14,8 +15,8 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use csv::{Reader, Writer};
 use parking_lot::RwLock;
-use r2d2::{ Pool };
-use r2d2_sqlite::{ SqliteConnectionManager };
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, Result};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
@@ -205,9 +206,12 @@ trait Datasource {
     fn get_latest_block(&self) -> i32;
     fn process_block_utxos(&self, pending_changes: &PendingChanges);
     fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate>;
-    fn get_utxos_for_block_and_address(&self, block_height: i32, address: &str) -> Option<Vec<UtxoUpdate>>;
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>>;
 }
-
 
 #[derive(Default)]
 struct UtxoCSVDatasource {
@@ -326,7 +330,8 @@ impl Datasource for UtxoCSVDatasource {
         for utxo in &changes.utxos_insert {
             let utxo_id = format!("{}:{}", utxo.txid, utxo.vout);
 
-            utxos.entry(utxo.address.clone())
+            utxos
+                .entry(utxo.address.clone())
                 .or_default()
                 .insert(utxo_id, utxo.clone());
 
@@ -337,7 +342,9 @@ impl Datasource for UtxoCSVDatasource {
         }
 
         // Add new block utxos
-        self.blocks.write().insert(changes.height.clone(), block_utxos.clone());
+        self.blocks
+            .write()
+            .insert(changes.height.clone(), block_utxos.clone());
 
         // Existing UTXOs we need to update
         for utxo in &changes.utxos_update {
@@ -380,7 +387,11 @@ impl Datasource for UtxoCSVDatasource {
         }
     }
 
-    fn get_utxos_for_block_and_address(&self, block_height: i32, address: &str) -> Option<Vec<UtxoUpdate>> {
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>> {
         self.blocks
             .read()
             .get(&block_height)
@@ -403,14 +414,12 @@ impl UtxoSqliteDatasource {
         let manager = SqliteConnectionManager::file(db_path);
         let conn = Pool::new(manager).unwrap();
 
-        return Arc::new(Self {
-            conn: conn,
-        });
+        return Arc::new(Self { conn: conn });
     }
 
     fn run_migrations(&self) -> Result<()> {
-        let migrations = Migrations::new(vec![
-            M::up("CREATE TABLE IF NOT EXISTS utxo (
+        let migrations = Migrations::new(vec![M::up(
+            "CREATE TABLE IF NOT EXISTS utxo (
                 vid INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
                 address TEXT NOT NULL,
@@ -426,8 +435,8 @@ impl UtxoSqliteDatasource {
                 spent_at TEXT,                 -- ISO 8061 format for timestamptz
                 spent_block INTEGER,
                 UNIQUE(txid, vout)             -- Ensure (txid, vout) is unique
-            )"),
-        ]);
+            )",
+        )]);
 
         let mut conn = self.conn.get().unwrap();
 
@@ -575,9 +584,11 @@ impl Datasource for UtxoSqliteDatasource {
                 created_at: created_at_parsed,
                 block_height: row.get(9)?,
                 spent_txid: row.get(10)?,
-                spent_at: row
-                    .get::<_, Option<String>>(11)?
-                    .map(|s| DateTime::parse_from_rfc3339(&s).unwrap().with_timezone(&Utc)),
+                spent_at: row.get::<_, Option<String>>(11)?.map(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                }),
                 spent_block: row.get(12)?,
             })
         }) {
@@ -640,9 +651,11 @@ impl Datasource for UtxoSqliteDatasource {
                 created_at: created_at_parsed,
                 block_height: row.get(9)?,
                 spent_txid: row.get(10)?,
-                spent_at: row
-                    .get::<_, Option<String>>(11)?
-                    .map(|s| DateTime::parse_from_rfc3339(&s).unwrap().with_timezone(&Utc)),
+                spent_at: row.get::<_, Option<String>>(11)?.map(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                }),
                 spent_block: row.get(12)?,
             })
         }) {
@@ -682,11 +695,12 @@ struct UtxoDatabase {
 
 impl UtxoDatabase {
     fn new(datasource: Arc<dyn Datasource + Send + Sync>) -> Arc<Self> {
-        info!("Initializing UTXO database with storage type: {}", datasource.get_type());
+        info!(
+            "Initializing UTXO database with storage type: {}",
+            datasource.get_type()
+        );
 
-        return Arc::new(Self {
-            datasource,
-        });
+        return Arc::new(Self { datasource });
     }
 
     fn get_latest_block(&self) -> i32 {
@@ -707,15 +721,11 @@ impl UtxoDatabase {
         // Process UTXO updates
         for utxo in block.utxo_updates {
             // Handle spent UTXOs first
-            if utxo.spent_txid.is_some()  {
-                pending_changes
-                    .utxos_update
-                    .push(utxo.clone());
+            if utxo.spent_txid.is_some() {
+                pending_changes.utxos_update.push(utxo.clone());
             } else {
                 // This is a new UTXO being created, track for saving
-                pending_changes
-                    .utxos_insert
-                    .push(utxo.clone());
+                pending_changes.utxos_insert.push(utxo.clone());
             }
         }
 
@@ -726,10 +736,17 @@ impl UtxoDatabase {
     }
 
     fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate> {
-        return self.datasource.get_spendable_utxos_at_height(block_height, address);
+        return self
+            .datasource
+            .get_spendable_utxos_at_height(block_height, address);
     }
 
-    fn select_utxos_for_amount(&self, block_height: i32, address: &str, target_amount: i64) -> Vec<UtxoUpdate> {
+    fn select_utxos_for_amount(
+        &self,
+        block_height: i32,
+        address: &str,
+        target_amount: i64,
+    ) -> Vec<UtxoUpdate> {
         let mut spendable_utxos = self.get_spendable_utxos_at_height(block_height, address);
 
         // Sort by block height (FIFO) - earlier blocks first
@@ -755,8 +772,14 @@ impl UtxoDatabase {
         }
     }
 
-    fn get_utxos_for_block_and_address(&self, block_height: i32, address: &str) -> Option<Vec<UtxoUpdate>> {
-        return self.datasource.get_utxos_for_block_and_address(block_height, address);
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>> {
+        return self
+            .datasource
+            .get_utxos_for_block_and_address(block_height, address);
     }
 }
 
@@ -929,7 +952,10 @@ fn create_datasource(arg: &str) -> Arc<dyn Datasource + Send + Sync> {
     match arg {
         "csv" => UtxoCSVDatasource::new(),
         "sqlite" => UtxoSqliteDatasource::new(),
-        _ => panic!("Invalid argument for datasource: {}, Use 'csv' or 'sqlite'", arg),
+        _ => panic!(
+            "Invalid argument for datasource: {}, Use 'csv' or 'sqlite'",
+            arg
+        ),
     }
 }
 
