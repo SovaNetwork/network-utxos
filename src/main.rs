@@ -15,6 +15,10 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use csv::{Reader, Writer};
 use parking_lot::RwLock;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, Connection, Result};
+use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, instrument};
 
@@ -32,6 +36,10 @@ struct Args {
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Datasource type
+    #[arg(long, default_value = "csv")]
+    datasource: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -187,28 +195,36 @@ struct UtxoUpdate {
 }
 
 struct PendingChanges {
-    new_utxos: HashMap<String, Vec<UtxoUpdate>>, // address -> new/modified UTXOs
-    new_block_utxos: HashMap<i32, HashMap<String, Vec<UtxoUpdate>>>, // height -> address -> UTXOs
+    height: i32,
+    utxos_update: Vec<UtxoUpdate>, // address -> modified UTXOs
+    utxos_insert: Vec<UtxoUpdate>,
 }
 
-/// UTXO database
-/// - utxos: btc_address -> HashMap<utxo_id, UtxoUpdate> (current UTXO set)
-/// - blocks: block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
-/// - latest_block: latest processed block height
-/// - data_dir: data directory
+trait Datasource {
+    fn setup(&self);
+    fn get_type(&self) -> String;
+    fn get_latest_block(&self) -> i32;
+    fn process_block_utxos(&self, pending_changes: &PendingChanges);
+    fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate>;
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>>;
+}
+
 #[derive(Default)]
-struct UtxoDatabase {
+struct UtxoCSVDatasource {
     utxos: RwLock<HashMap<String, HashMap<String, UtxoUpdate>>>,
     blocks: RwLock<HashMap<i32, HashMap<String, Vec<UtxoUpdate>>>>,
     latest_block: RwLock<i32>,
     data_dir: PathBuf,
 }
 
-impl UtxoDatabase {
-    fn new(data_dir: PathBuf) -> Arc<Self> {
-        info!("Initializing UTXO database with storage at {:?}", data_dir);
-
+impl UtxoCSVDatasource {
+    fn new() -> Arc<Self> {
         // Create data directory if it doesn't exist
+        let data_dir = std::env::current_dir().unwrap().join("data");
         fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
         let db = Arc::new(Self {
@@ -232,62 +248,6 @@ impl UtxoDatabase {
 
     fn get_block_file_path(&self) -> PathBuf {
         self.data_dir.join("blocks.csv")
-    }
-
-    fn save_changes(&self, changes: PendingChanges) -> io::Result<()> {
-        // Save UTXOs
-        if !changes.new_utxos.is_empty() {
-            let utxo_path = self.get_utxo_file_path();
-            let needs_header = !utxo_path.exists();
-
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(true)
-                .open(&utxo_path)?;
-
-            // Create a Writer that uses the file's current position
-            let mut writer = csv::WriterBuilder::new()
-                .has_headers(needs_header) // Only write headers if it's a new file
-                .from_writer(file);
-
-            for (address, utxos) in changes.new_utxos {
-                for utxo in utxos {
-                    let row = UtxoRow::new(address.clone(), utxo);
-                    writer.serialize(&row)?;
-                }
-            }
-            writer.flush()?;
-        }
-
-        // Save blocks
-        if !changes.new_block_utxos.is_empty() {
-            let block_path = self.get_block_file_path();
-            let needs_header = !block_path.exists();
-
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(true)
-                .open(&block_path)?;
-
-            // Create a Writer that uses the file's current position
-            let mut writer = csv::WriterBuilder::new()
-                .has_headers(needs_header) // Only write headers if it's a new file
-                .from_writer(file);
-
-            for (height, block_data) in changes.new_block_utxos {
-                for (address, utxos) in block_data {
-                    for utxo in utxos {
-                        let row = BlockRow::new(height, address.clone(), utxo);
-                        writer.serialize(&row)?;
-                    }
-                }
-            }
-            writer.flush()?;
-        }
-
-        Ok(())
     }
 
     fn load_data(&self) -> io::Result<()> {
@@ -345,156 +305,68 @@ impl UtxoDatabase {
 
         Ok(())
     }
+}
 
-    #[instrument(skip(self, block), fields(block_height = block.height))]
-    async fn process_block(&self, block: BlockUpdate) -> Result<(), String> {
-        let height = block.height;
-        info!(height, "Processing new block");
-
-        let mut pending_changes = PendingChanges {
-            new_utxos: HashMap::new(),
-            new_block_utxos: HashMap::new(),
-        };
-
-        {
-            let mut block_utxos: HashMap<String, Vec<UtxoUpdate>> = HashMap::new();
-            let mut utxos = self.utxos.write();
-
-            // Process UTXO updates
-            for utxo in block.utxo_updates {
-                // Handle spent UTXOs first
-                if let Some(spent_txid) = &utxo.spent_txid {
-                    // If this UTXO is being spent, mark it as spent in the global UTXO set
-                    if let Some(address_utxos) = utxos.get_mut(&utxo.address) {
-                        let utxo_id = format!("{}:{}", utxo.txid, utxo.vout);
-                        if let Some(existing_utxo) = address_utxos.get_mut(&utxo_id) {
-                            existing_utxo.spent_txid = Some(spent_txid.clone());
-                            existing_utxo.spent_at = utxo.spent_at;
-                            existing_utxo.spent_block = Some(height);
-
-                            // Track modified UTXO for saving
-                            pending_changes
-                                .new_utxos
-                                .entry(utxo.address.clone())
-                                .or_default()
-                                .push(existing_utxo.clone());
-                        }
-                    }
-                } else {
-                    // This is a new UTXO being created
-                    let utxo_id = format!("{}:{}", utxo.txid, utxo.vout);
-
-                    // Add to global UTXO set
-                    utxos
-                        .entry(utxo.address.clone())
-                        .or_default()
-                        .insert(utxo_id, utxo.clone());
-
-                    // Track new UTXO for saving
-                    pending_changes
-                        .new_utxos
-                        .entry(utxo.address.clone())
-                        .or_default()
-                        .push(utxo.clone());
-
-                    // Add to block's UTXO set
-                    block_utxos
-                        .entry(utxo.address.clone())
-                        .or_default()
-                        .push(utxo);
-                }
-            }
-
-            // Update block data
-            let block_utxos_clone = block_utxos.clone();
-            self.blocks.write().insert(height, block_utxos);
-            *self.latest_block.write() = height;
-
-            // Track new block data for saving
-            pending_changes
-                .new_block_utxos
-                .insert(height, block_utxos_clone);
-        }
-
-        if let Err(e) = self.save_changes(pending_changes) {
-            error!(height, error = %e, "Failed to save data after block processing");
-            return Err(format!("Failed to save data: {}", e));
-        }
-
-        info!(height, "Block processing completed");
-        Ok(())
+impl Datasource for UtxoCSVDatasource {
+    fn setup(&self) {
+        // No setup required
+        return;
     }
 
-    #[instrument(skip(self), fields(block_height = height))]
-    async fn handle_rollback(&self, height: i32) -> Result<(), String> {
-        info!(height, "Processing rollback");
-
-        let mut pending_changes = PendingChanges {
-            new_utxos: HashMap::new(),
-            new_block_utxos: HashMap::new(),
-        };
-
-        {
-            let mut blocks = self.blocks.write();
-            if let Some(block_utxos) = blocks.remove(&height) {
-                let mut utxos = self.utxos.write();
-                for (address, block_utxo_list) in block_utxos {
-                    if let Some(address_utxos) = utxos.get_mut(&address) {
-                        // Remove UTXOs created in this block
-                        for utxo in block_utxo_list {
-                            let utxo_id = format!("{}:{}", utxo.txid, utxo.vout);
-                            address_utxos.remove(&utxo_id);
-                        }
-
-                        // Unmark any UTXOs that were spent in this block
-                        for utxo in address_utxos.values_mut() {
-                            if utxo.spent_block == Some(height) {
-                                utxo.spent_txid = None;
-                                utxo.spent_at = None;
-                                utxo.spent_block = None;
-
-                                // Add to pending changes
-                                pending_changes
-                                    .new_utxos
-                                    .entry(utxo.address.clone())
-                                    .or_default()
-                                    .push(utxo.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut latest = self.latest_block.write();
-            if *latest == height {
-                *latest = height - 1;
-                info!(new_height = height - 1, "Updated latest block height");
-            }
-        }
-
-        if let Err(e) = self.save_changes(pending_changes) {
-            error!(height, error = %e, "Failed to save data after rollback");
-            return Err(format!("Failed to save data: {}", e));
-        }
-
-        info!(height, "Rollback completed");
-        Ok(())
+    fn get_latest_block(&self) -> i32 {
+        let value = self.latest_block.read();
+        *value
     }
 
-    fn get_utxos_for_block_and_address(
-        &self,
-        block_height: i32,
-        address: &str,
-    ) -> Option<Vec<UtxoUpdate>> {
+    fn get_type(&self) -> String {
+        String::from("CSV")
+    }
+
+    fn process_block_utxos(&self, changes: &PendingChanges) {
+        let mut utxos = self.utxos.write();
+        let mut block_utxos: HashMap<String, Vec<UtxoUpdate>> = HashMap::new();
+
+        // New UTXOs we need to add to an address' set
+        for utxo in &changes.utxos_insert {
+            let utxo_id = format!("{}:{}", utxo.txid, utxo.vout);
+
+            utxos
+                .entry(utxo.address.clone())
+                .or_default()
+                .insert(utxo_id, utxo.clone());
+
+            block_utxos
+                .entry(utxo.address.clone())
+                .or_default()
+                .push(utxo.clone())
+        }
+
+        // Add new block utxos
         self.blocks
-            .read()
-            .get(&block_height)
-            .and_then(|block_data| block_data.get(address))
-            .map(|utxos| utxos.clone())
+            .write()
+            .insert(changes.height.clone(), block_utxos.clone());
+
+        // Existing UTXOs we need to update
+        for utxo in &changes.utxos_update {
+            let utxo_id = format!("{}:{}", utxo.txid, utxo.vout);
+
+            if let Some(address_utxos) = utxos.get_mut(&utxo.address) {
+                if let Some(existing_utxo) = address_utxos.get_mut(&utxo_id) {
+                    existing_utxo.spent_txid = utxo.spent_txid.clone();
+                    existing_utxo.spent_at = utxo.spent_at.clone();
+                    existing_utxo.spent_block = utxo.spent_block.clone();
+                }
+            }
+        }
+
+        *self.latest_block.write() = changes.height.clone();
+
+        // save_changes to csv
     }
 
     fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate> {
         let utxos = self.utxos.read();
+
         if let Some(address_utxos) = utxos.get(address) {
             // Filter UTXOs that:
             // 1. Were created at or before this block height
@@ -515,7 +387,360 @@ impl UtxoDatabase {
         }
     }
 
-    // Add this new method to select UTXOs
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>> {
+        self.blocks
+            .read()
+            .get(&block_height)
+            .and_then(|block_data| block_data.get(address))
+            .map(|utxos| utxos.clone())
+    }
+}
+
+struct UtxoSqliteDatasource {
+    conn: Pool<SqliteConnectionManager>,
+}
+
+impl UtxoSqliteDatasource {
+    fn new() -> Arc<Self> {
+        let data_dir = std::env::current_dir().unwrap().join("data");
+        fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+        let db_dir = data_dir.join("utxo.db");
+        let db_path = db_dir.to_str().unwrap();
+
+        let manager = SqliteConnectionManager::file(db_path);
+        let conn = Pool::new(manager).unwrap();
+
+        return Arc::new(Self { conn: conn });
+    }
+
+    fn run_migrations(&self) -> Result<()> {
+        let migrations = Migrations::new(vec![M::up(
+            "CREATE TABLE IF NOT EXISTS utxo (
+                vid INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                address TEXT NOT NULL,
+                public_key TEXT,
+                txid TEXT NOT NULL,
+                vout INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                script_pub_key TEXT NOT NULL,
+                script_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,      -- ISO 8061 format for timestamptz
+                block_height INTEGER NOT NULL,
+                spent_txid TEXT,
+                spent_at TEXT,                 -- ISO 8061 format for timestamptz
+                spent_block INTEGER,
+                UNIQUE(txid, vout)             -- Ensure (txid, vout) is unique
+            )",
+        )]);
+
+        let mut conn = self.conn.get().unwrap();
+
+        let _ = migrations.to_latest(&mut conn);
+
+        Ok(())
+    }
+
+    fn upsert_utxo_in_tx(tx: &rusqlite::Transaction, utxo: &UtxoUpdate) -> rusqlite::Result<()> {
+        tx.execute(
+            "INSERT INTO utxo (
+                id, address, public_key, txid, vout, amount, script_pub_key, 
+                script_type, created_at, block_height, spent_txid, spent_at, spent_block
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(id) DO UPDATE SET
+                spent_txid = excluded.spent_txid,
+                spent_at = excluded.spent_at,
+                spent_block = excluded.spent_block",
+            params![
+                utxo.id,
+                utxo.address,
+                utxo.public_key,
+                utxo.txid,
+                utxo.vout,
+                utxo.amount,
+                utxo.script_pub_key,
+                utxo.script_type,
+                utxo.created_at.to_rfc3339(),
+                utxo.block_height,
+                utxo.spent_txid,
+                utxo.spent_at.map(|dt| dt.to_rfc3339()),
+                utxo.spent_block,
+            ],
+        )?;
+
+        Ok(())
+    }
+}
+
+impl Datasource for UtxoSqliteDatasource {
+    fn setup(&self) {
+        let _ = self.run_migrations();
+
+        return;
+    }
+
+    fn get_type(&self) -> String {
+        String::from("Sqlite")
+    }
+
+    fn get_latest_block(&self) -> i32 {
+        let conn = self.conn.get().unwrap();
+        let query = "
+            SELECT MAX(
+                CASE
+                    WHEN spent_block IS NOT NULL AND spent_block > block_height THEN spent_block
+                    ELSE block_height
+                END
+            ) AS latest_block
+            FROM utxo;
+        ";
+
+        match conn.query_row(query, [], |row| row.get(0)) {
+            Ok(latest_block) => latest_block,
+            Err(e) => {
+                eprintln!("Failed to query the latest block: {}", e);
+                0 // Return 0 in case of an error
+            }
+        }
+    }
+
+    fn process_block_utxos(&self, changes: &PendingChanges) {
+        let mut conn = self.conn.get().unwrap();
+
+        // Start a transaction
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                eprintln!("Failed to start transaction: {}", e);
+                return;
+            }
+        };
+
+        // Upsert UTXOs from utxos_update
+        for utxo in &changes.utxos_update {
+            if let Err(e) = UtxoSqliteDatasource::upsert_utxo_in_tx(&tx, utxo) {
+                eprintln!("Failed to upsert UTXO {}: {}", utxo.id, e);
+                tx.rollback().expect("Failed to rollback transaction");
+                return;
+            }
+        }
+
+        // Upsert UTXOs from utxos_insert
+        for utxo in &changes.utxos_insert {
+            if let Err(e) = UtxoSqliteDatasource::upsert_utxo_in_tx(&tx, utxo) {
+                eprintln!("Failed to upsert UTXO {}: {}", utxo.id, e);
+                tx.rollback().expect("Failed to rollback transaction");
+                return;
+            }
+        }
+
+        // Commit the transaction
+        if let Err(e) = tx.commit() {
+            eprintln!("Failed to commit transaction: {}", e);
+        } else {
+            println!("Processed block UTXOs for height {}", changes.height);
+        }
+    }
+
+    fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate> {
+        let conn = self.conn.get().unwrap();
+
+        let mut stmt = match conn.prepare(
+            "SELECT 
+                id, address, public_key, txid, vout, amount, script_pub_key, 
+                script_type, created_at, block_height, spent_txid, spent_at, spent_block
+             FROM utxo
+             WHERE block_height <= ?1 AND spent_at IS NULL AND address = ?2",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("Failed to prepare statement: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let mut results = Vec::new();
+
+        // Use params! to ensure the types of block_height and address match the placeholders
+        let rows = match stmt.query_map(params![block_height, address], |row| {
+            let created_at = row.get::<_, String>(8)?;
+            let created_at_parsed = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                .with_timezone(&Utc);
+
+            Ok(UtxoUpdate {
+                id: row.get(0)?,
+                address: row.get(1)?,
+                public_key: row.get(2)?,
+                txid: row.get(3)?,
+                vout: row.get(4)?,
+                amount: row.get(5)?,
+                script_pub_key: row.get(6)?,
+                script_type: row.get(7)?,
+                created_at: created_at_parsed,
+                block_height: row.get(9)?,
+                spent_txid: row.get(10)?,
+                spent_at: row.get::<_, Option<String>>(11)?.map(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                }),
+                spent_block: row.get(12)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("Failed to query rows: {}", e);
+                return Vec::new();
+            }
+        };
+
+        for row in rows {
+            match row {
+                Ok(utxo) => results.push(utxo),
+                Err(e) => eprintln!("Failed to process row: {}", e),
+            }
+        }
+
+        results
+    }
+
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>> {
+        let conn = self.conn.get().unwrap();
+        let query = "
+            SELECT 
+                id, address, public_key, txid, vout, amount, script_pub_key, 
+                script_type, created_at, block_height, spent_txid, spent_at, spent_block
+            FROM utxo
+            WHERE block_height = ?1 AND address = ?2;
+        ";
+
+        // Prepare the statement
+        let mut stmt = match conn.prepare(query) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("Failed to prepare statement: {}", e);
+                return None;
+            }
+        };
+
+        // Execute the query and map results to UtxoUpdate
+        let rows = match stmt.query_map(params![block_height, address], |row| {
+            let created_at = row.get::<_, String>(8)?;
+            let created_at_parsed = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                .with_timezone(&Utc);
+
+            Ok(UtxoUpdate {
+                id: row.get(0)?,
+                address: row.get(1)?,
+                public_key: row.get(2)?,
+                txid: row.get(3)?,
+                vout: row.get(4)?,
+                amount: row.get(5)?,
+                script_pub_key: row.get(6)?,
+                script_type: row.get(7)?,
+                created_at: created_at_parsed,
+                block_height: row.get(9)?,
+                spent_txid: row.get(10)?,
+                spent_at: row.get::<_, Option<String>>(11)?.map(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                }),
+                spent_block: row.get(12)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("Failed to query rows: {}", e);
+                return None;
+            }
+        };
+
+        // Collect the results into a vector
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(utxo) => results.push(utxo),
+                Err(e) => eprintln!("Failed to process row: {}", e),
+            }
+        }
+
+        // Return the results if not empty, otherwise return None
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
+    }
+}
+
+/// UTXO database
+/// - utxos: btc_address -> HashMap<utxo_id, UtxoUpdate> (current UTXO set)
+/// - blocks: block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
+/// - latest_block: latest processed block height
+/// - data_dir: data directory
+struct UtxoDatabase {
+    datasource: Arc<dyn Datasource + Send + Sync>, // Send + Sync to make Arc thread safe
+}
+
+impl UtxoDatabase {
+    fn new(datasource: Arc<dyn Datasource + Send + Sync>) -> Arc<Self> {
+        info!(
+            "Initializing UTXO database with storage type: {}",
+            datasource.get_type()
+        );
+
+        return Arc::new(Self { datasource });
+    }
+
+    fn get_latest_block(&self) -> i32 {
+        return self.datasource.get_latest_block();
+    }
+
+    #[instrument(skip(self, block), fields(block_height = block.height))]
+    async fn process_block(&self, block: BlockUpdate) -> Result<(), String> {
+        let height = block.height;
+        info!(height, "Processing new block");
+
+        let mut pending_changes = PendingChanges {
+            height: height,
+            utxos_update: Vec::new(),
+            utxos_insert: Vec::new(),
+        };
+
+        // Process UTXO updates
+        for utxo in block.utxo_updates {
+            // Handle spent UTXOs first
+            if utxo.spent_txid.is_some() {
+                pending_changes.utxos_update.push(utxo.clone());
+            } else {
+                // This is a new UTXO being created, track for saving
+                pending_changes.utxos_insert.push(utxo.clone());
+            }
+        }
+
+        self.datasource.process_block_utxos(&pending_changes);
+
+        info!(height, "Block processing completed");
+        Ok(())
+    }
+
+    fn get_spendable_utxos_at_height(&self, block_height: i32, address: &str) -> Vec<UtxoUpdate> {
+        return self
+            .datasource
+            .get_spendable_utxos_at_height(block_height, address);
+    }
+
     fn select_utxos_for_amount(
         &self,
         block_height: i32,
@@ -545,6 +770,16 @@ impl UtxoDatabase {
         } else {
             Vec::new()
         }
+    }
+
+    fn get_utxos_for_block_and_address(
+        &self,
+        block_height: i32,
+        address: &str,
+    ) -> Option<Vec<UtxoUpdate>> {
+        return self
+            .datasource
+            .get_utxos_for_block_and_address(block_height, address);
     }
 }
 
@@ -586,7 +821,7 @@ async fn get_block_address_utxos(
 
     info!(block_height, %address, "Querying UTXOs for block and address");
 
-    let latest_block = *state.db.latest_block.read();
+    let latest_block = state.db.get_latest_block();
     if block_height > latest_block {
         return HttpResponse::NotFound().json(serde_json::json!({
             "error": "Block not found",
@@ -629,7 +864,7 @@ async fn get_spendable_utxos(
 
     info!(block_height, %address, "Querying spendable UTXOs for address at height");
 
-    let latest_block = *state.db.latest_block.read();
+    let latest_block = state.db.get_latest_block();
     if block_height > latest_block {
         return HttpResponse::NotFound().json(serde_json::json!({
             "error": "Block not found",
@@ -675,7 +910,7 @@ async fn select_utxos(
         "Selecting UTXOs for amount using FIFO"
     );
 
-    let latest_block = *state.db.latest_block.read();
+    let latest_block = state.db.get_latest_block();
     if block_height > latest_block {
         return HttpResponse::NotFound().json(serde_json::json!({
             "error": "Block not found",
@@ -713,6 +948,17 @@ async fn select_utxos(
     HttpResponse::Ok().json(response)
 }
 
+fn create_datasource(arg: &str) -> Arc<dyn Datasource + Send + Sync> {
+    match arg {
+        "csv" => UtxoCSVDatasource::new(),
+        "sqlite" => UtxoSqliteDatasource::new(),
+        _ => panic!(
+            "Invalid argument for datasource: {}, Use 'csv' or 'sqlite'",
+            arg
+        ),
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -722,9 +968,11 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     info!("Starting UTXO tracking service");
+    let datasource = create_datasource(&args.datasource);
 
-    let data_dir = std::env::current_dir()?.join("data");
-    let db = UtxoDatabase::new(data_dir);
+    datasource.setup();
+
+    let db = UtxoDatabase::new(datasource);
     let state = web::Data::new(AppState { db });
 
     let bind_addr = format!("{}:{}", args.host, args.port);
