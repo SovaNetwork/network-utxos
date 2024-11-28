@@ -6,8 +6,10 @@ WORKDIR /usr/src/app
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev && \
-    libsqlite3-dev \
+    apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libsqlite3-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
@@ -25,8 +27,9 @@ FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y ca-certificates && \
-    libsqlite3-0 \
+    apt-get install -y \
+    ca-certificates \
+    libsqlite3-0 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
