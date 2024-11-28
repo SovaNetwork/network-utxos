@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs::{self, OpenOptions},
-    io,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, fs, io, path::PathBuf, sync::Arc};
 
 use actix_web::{
     middleware::Logger,
@@ -13,11 +7,11 @@ use actix_web::{
 };
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use csv::{Reader, Writer};
+use csv::Reader;
 use parking_lot::RwLock;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Result};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, instrument};
@@ -65,26 +59,6 @@ struct UtxoRow {
 }
 
 impl UtxoRow {
-    fn new(address: String, utxo: UtxoUpdate) -> Self {
-        Self {
-            address,
-            utxo_id: utxo.id.clone(),
-            id: utxo.id,
-            utxo_address: utxo.address,
-            public_key: utxo.public_key,
-            txid: utxo.txid,
-            vout: utxo.vout,
-            amount: utxo.amount,
-            script_pub_key: utxo.script_pub_key,
-            script_type: utxo.script_type,
-            created_at: utxo.created_at,
-            block_height: utxo.block_height,
-            spent_txid: utxo.spent_txid,
-            spent_at: utxo.spent_at,
-            spent_block: utxo.spent_block,
-        }
-    }
-
     fn into_storage_entry(self) -> (String, String, UtxoUpdate) {
         let utxo = UtxoUpdate {
             id: self.id,
@@ -128,26 +102,6 @@ struct BlockRow {
 }
 
 impl BlockRow {
-    fn new(height: i32, address: String, utxo: UtxoUpdate) -> Self {
-        Self {
-            height,
-            address,
-            id: utxo.id,
-            utxo_address: utxo.address,
-            public_key: utxo.public_key,
-            txid: utxo.txid,
-            vout: utxo.vout,
-            amount: utxo.amount,
-            script_pub_key: utxo.script_pub_key,
-            script_type: utxo.script_type,
-            created_at: utxo.created_at,
-            block_height: utxo.block_height,
-            spent_txid: utxo.spent_txid,
-            spent_at: utxo.spent_at,
-            spent_block: utxo.spent_block,
-        }
-    }
-
     fn into_utxo(self) -> UtxoUpdate {
         UtxoUpdate {
             id: self.id,
@@ -213,6 +167,11 @@ trait Datasource {
     ) -> Option<Vec<UtxoUpdate>>;
 }
 
+/// UtxoCSVDatasource
+/// - utxos: btc_address -> HashMap<utxo_id, UtxoUpdate> (current UTXO set)
+/// - blocks: block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
+/// - latest_block: latest processed block height
+/// - data_dir: data directory
 #[derive(Default)]
 struct UtxoCSVDatasource {
     utxos: RwLock<HashMap<String, HashMap<String, UtxoUpdate>>>,
@@ -684,11 +643,6 @@ impl Datasource for UtxoSqliteDatasource {
     }
 }
 
-/// UTXO database
-/// - utxos: btc_address -> HashMap<utxo_id, UtxoUpdate> (current UTXO set)
-/// - blocks: block_height -> HashMap<btc_address, Vec<UtxoUpdate>> (UTXOs created/spent in this block)
-/// - latest_block: latest processed block height
-/// - data_dir: data directory
 struct UtxoDatabase {
     datasource: Arc<dyn Datasource + Send + Sync>, // Send + Sync to make Arc thread safe
 }
