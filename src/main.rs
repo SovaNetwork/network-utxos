@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io, path::PathBuf, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fs, io, path::PathBuf, sync::Arc};
 
 use actix_web::{
     middleware::Logger,
@@ -165,6 +165,7 @@ trait Datasource {
         block_height: i32,
         address: &str,
     ) -> Option<Vec<UtxoUpdate>>;
+    fn get_all_utxos_for_block(&self, block_height: i32) -> Option<Vec<UtxoUpdate>>;
 }
 
 /// UtxoCSVDatasource
@@ -356,6 +357,15 @@ impl Datasource for UtxoCSVDatasource {
             .get(&block_height)
             .and_then(|block_data| block_data.get(address))
             .map(|utxos| utxos.clone())
+    }
+
+    fn get_all_utxos_for_block(&self, block_height: i32) -> Option<Vec<UtxoUpdate>> {
+        let blocks = self.blocks.read();
+        blocks.get(&block_height).map(|block_data| {
+            block_data.values()
+                .flat_map(|utxos| utxos.iter().cloned())
+                .collect()
+        })
     }
 }
 
@@ -641,6 +651,72 @@ impl Datasource for UtxoSqliteDatasource {
             Some(results)
         }
     }
+
+    fn get_all_utxos_for_block(&self, block_height: i32) -> Option<Vec<UtxoUpdate>> {
+        let conn = self.conn.get().unwrap();
+        let query = "
+            SELECT 
+                id, address, public_key, txid, vout, amount, script_pub_key, 
+                script_type, created_at, block_height, spent_txid, spent_at, spent_block
+            FROM utxo
+            WHERE block_height = ?1;
+        ";
+
+        let mut stmt = match conn.prepare(query) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("Failed to prepare statement: {}", e);
+                return None;
+            }
+        };
+
+        let rows = match stmt.query_map([block_height], |row| {
+            let created_at = row.get::<_, String>(8)?;
+            let created_at_parsed = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                .with_timezone(&Utc);
+
+            Ok(UtxoUpdate {
+                id: row.get(0)?,
+                address: row.get(1)?,
+                public_key: row.get(2)?,
+                txid: row.get(3)?,
+                vout: row.get(4)?,
+                amount: row.get(5)?,
+                script_pub_key: row.get(6)?,
+                script_type: row.get(7)?,
+                created_at: created_at_parsed,
+                block_height: row.get(9)?,
+                spent_txid: row.get(10)?,
+                spent_at: row.get::<_, Option<String>>(11)?.map(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                }),
+                spent_block: row.get(12)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("Failed to query rows: {}", e);
+                return None;
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(utxo) => results.push(utxo),
+                Err(e) => eprintln!("Failed to process row: {}", e),
+            }
+        }
+
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
+    }
 }
 
 struct UtxoDatabase {
@@ -734,6 +810,26 @@ impl UtxoDatabase {
         return self
             .datasource
             .get_utxos_for_block_and_address(block_height, address);
+    }
+
+    fn get_block_txids(&self, block_height: i32) -> Vec<String> {
+        let mut txids = HashSet::new();
+        
+        // Get all UTXOs for this block height from the datasource
+        if let Some(utxos) = self.datasource.get_all_utxos_for_block(block_height) {
+            // Collect txids from UTXOs created in this block
+            for utxo in utxos {
+                txids.insert(utxo.txid.clone());
+                // Also include spending transactions that happened in this block
+                if let Some(spent_txid) = utxo.spent_txid {
+                    if utxo.spent_block == Some(block_height) {
+                        txids.insert(spent_txid);
+                    }
+                }
+            }
+        }
+        
+        txids.into_iter().collect()
     }
 }
 
@@ -902,6 +998,55 @@ async fn select_utxos(
     HttpResponse::Ok().json(response)
 }
 
+#[derive(Serialize)]
+struct LatestBlockResponse {
+    latest_block: i32,
+}
+
+#[instrument(skip(state))]
+async fn get_latest_block(state: web::Data<AppState>) -> HttpResponse {
+    info!("Getting latest block height");
+
+    let latest_block = state.db.get_latest_block();
+    
+    let response = LatestBlockResponse {
+        latest_block,
+    };
+
+    HttpResponse::Ok().json(response)
+}
+
+#[derive(Serialize)]
+struct BlockTxidsResponse {
+    txids: Vec<String>,
+}
+
+#[instrument(skip(state))]
+async fn get_block_txids(
+    state: web::Data<AppState>,
+    path: web::Path<i32>,
+) -> HttpResponse {
+    let block_height = path.into_inner();
+
+    info!(block_height, "Getting transaction IDs for block");
+
+    let latest_block = state.db.get_latest_block();
+    if block_height > latest_block {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Block not found",
+            "latest_block": latest_block
+        }));
+    }
+
+    let txids = state.db.get_block_txids(block_height);
+    
+    let response = BlockTxidsResponse {
+        txids,
+    };
+
+    HttpResponse::Ok().json(response)
+}
+
 fn create_datasource(arg: &str) -> Arc<dyn Datasource + Send + Sync> {
     match arg {
         "csv" => UtxoCSVDatasource::new(),
@@ -937,6 +1082,8 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .app_data(state.clone())
             .route("/hook", web::post().to(handle_webhook))
+            .route("/latest-block", web::get().to(get_latest_block))
+            .route("/block/{height}/txids", web::get().to(get_block_txids))
             .route(
                 "/utxos/block/{height}/address/{address}",
                 web::get().to(get_block_address_utxos),
