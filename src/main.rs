@@ -1,4 +1,9 @@
-use std::{collections::{HashMap, HashSet}, fs, io, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs, io,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use actix_web::{
     middleware::Logger,
@@ -362,7 +367,8 @@ impl Datasource for UtxoCSVDatasource {
     fn get_all_utxos_for_block(&self, block_height: i32) -> Option<Vec<UtxoUpdate>> {
         let blocks = self.blocks.read();
         blocks.get(&block_height).map(|block_data| {
-            block_data.values()
+            block_data
+                .values()
                 .flat_map(|utxos| utxos.iter().cloned())
                 .collect()
         })
@@ -814,7 +820,7 @@ impl UtxoDatabase {
 
     fn get_block_txids(&self, block_height: i32) -> Vec<String> {
         let mut txids = HashSet::new();
-        
+
         // Get all UTXOs for this block height from the datasource
         if let Some(utxos) = self.datasource.get_all_utxos_for_block(block_height) {
             // Collect txids from UTXOs created in this block
@@ -828,7 +834,7 @@ impl UtxoDatabase {
                 }
             }
         }
-        
+
         txids.into_iter().collect()
     }
 }
@@ -1008,10 +1014,8 @@ async fn get_latest_block(state: web::Data<AppState>) -> HttpResponse {
     info!("Getting latest block height");
 
     let latest_block = state.db.get_latest_block();
-    
-    let response = LatestBlockResponse {
-        latest_block,
-    };
+
+    let response = LatestBlockResponse { latest_block };
 
     HttpResponse::Ok().json(response)
 }
@@ -1022,10 +1026,7 @@ struct BlockTxidsResponse {
 }
 
 #[instrument(skip(state))]
-async fn get_block_txids(
-    state: web::Data<AppState>,
-    path: web::Path<i32>,
-) -> HttpResponse {
+async fn get_block_txids(state: web::Data<AppState>, path: web::Path<i32>) -> HttpResponse {
     let block_height = path.into_inner();
 
     info!(block_height, "Getting transaction IDs for block");
@@ -1039,10 +1040,8 @@ async fn get_block_txids(
     }
 
     let txids = state.db.get_block_txids(block_height);
-    
-    let response = BlockTxidsResponse {
-        txids,
-    };
+
+    let response = BlockTxidsResponse { txids };
 
     HttpResponse::Ok().json(response)
 }
