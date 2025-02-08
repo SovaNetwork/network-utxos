@@ -1,4 +1,4 @@
-# UTXO Tracking Database
+# UTXO Tracking Database for the Sova Network
 
 A UTXO database built with Rust and Actix Web. This service maintains an in-memory database of Bitcoin UTXOs, providing real-time access to UTXO sets at specific block heights and efficient UTXO selection capabilities.
 
@@ -68,6 +68,7 @@ Receives block updates and processes UTXO changes.
       "block_height": 123456
     }
   ]
+}
 ```
 
 ### GET `/utxos/block/{height}/address/{address}`
@@ -112,4 +113,3 @@ curl "http://localhost:5557/select-utxos/block/128/address/bcrt1qdqvts4mprnngm0j
   "total_amount": 999900000
 }
 ```
-

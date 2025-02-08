@@ -33,7 +33,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
-COPY --from=builder /usr/src/app/target/release/hyperstate-utxos /usr/local/bin/
+COPY --from=builder /usr/src/app/target/release/network-utxos /usr/local/bin/
 
 # Create a non-root user with specific UID and create data directory
 RUN useradd -m -u 1001 webhook && \
@@ -51,4 +51,4 @@ WORKDIR /data
 EXPOSE 5557
 
 # Run the binary
-CMD ["hyperstate-utxos"]
+CMD ["network-utxos"]
