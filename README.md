@@ -1,3 +1,6 @@
+# ⚠️ IMPORTANT: THIS SERVICE HAS BEEN ARCHIVED AND MOVED ⚠️
+# Please go to: https://github.com/SovaNetwork/utxo-tracing
+
 # UTXO Tracking Database for the Sova Network
 
 A UTXO database built with Rust and Actix Web. This service maintains an in-memory database of Bitcoin UTXOs, providing real-time access to UTXO sets at specific block heights and efficient UTXO selection capabilities.
